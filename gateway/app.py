@@ -20628,7 +20628,28 @@ async def session_browser_control(sid: str, body: BrowserControlBody, request: R
     return {"session_id": sid, "open": True, "control": who}
 
 
-_browser_open_locks: dict[str, asyncio.Lock] = {}
+_browser_open_locks: dict[str, list] = {}
+
+
+@contextlib.asynccontextmanager
+async def _browser_open_lock(sid: str):
+    """A lock per session that exists only while someone holds or waits for it."""
+    held = _browser_open_locks.setdefault(sid, [asyncio.Lock(), 0])
+    held[1] += 1
+    try:
+        await held[0].acquire()
+    except BaseException:
+        held[1] -= 1
+        if not held[1] and _browser_open_locks.get(sid) is held:
+            del _browser_open_locks[sid]
+        raise
+    try:
+        yield
+    finally:
+        held[0].release()
+        held[1] -= 1
+        if not held[1] and _browser_open_locks.get(sid) is held:
+            del _browser_open_locks[sid]
 # How long one held browser call waits for the person to hand the browser back before answering
 # that it is still theirs (under the MCP clients' 60 s request timeout), and how often it looks.
 BROWSER_HOLD_SLICE_S = float(os.environ.get("HR_BROWSER_HOLD_SLICE_S", "45"))
@@ -20667,7 +20688,7 @@ async def _browser_plug_call(rid, hid: str, sid: str, org: str, workspace: str, 
         return _jsonrpc_result(rid, _tool_text("The browser service could not be reached. Try again.", True))
     s = None
     if rec is None:
-        async with _browser_open_locks.setdefault(sid, asyncio.Lock()):
+        async with _browser_open_lock(sid):
             rec = await browser_plane.registry.get(sid)     # the call that waited finds the browser the first one opened
             if rec is None:
                 # The first call opens the browser: the estimate is written on the row for the record
@@ -20771,7 +20792,6 @@ async def _browser_close(sid: str, reason: str) -> None:
         if s is not None:
             await browser_plane.detach(s)
         return
-    _browser_open_locks.pop(sid, None)
     _browser_notice(sid, "closed", hid=str(rec.get("hid") or ""), org=str(rec.get("org") or ""), reason=reason)
     try:
         fig = await browser_plane.close_session_browser(rec, s)

@@ -731,6 +731,263 @@ def test_two_first_calls_at_once_open_one_browser(client, world, monkeypatch):
     assert sid not in gw._browser_open_locks
 
 
+def _open_waiter_queued(sid: str) -> bool:
+    entry = gw._browser_open_locks.get(sid)
+    return isinstance(entry, list) and entry[1] == 2
+
+
+async def _wait_until(pred) -> None:
+    while not pred():
+        await asyncio.sleep(0)
+
+
+def test_failed_browser_open_does_not_leak_open_lock(client, world, monkeypatch):
+    """A refused or failing open must not leave an entry in _browser_open_locks."""
+    reg, ven, _ = world
+    reg.record = _record()
+    hid = _harness(client)
+    _include(client, hid)
+    sid1, sid2 = _session_of(hid), _session_of(hid)
+    cfg = {"allow_domains": [], "deny_domains": []}
+
+    async def go():
+        ven.refuse = 402
+        r_refused = await gw._browser_plug_call(
+            1, hid, sid1, ORG, WS, "navigate", plugs_plane.find("browser", "navigate"),
+            {"url": "example.com"}, cfg, time.time(),
+        )
+        assert json.loads(r_refused.body)["result"]["isError"] is True
+        assert sid1 not in gw._browser_open_locks
+        await gw._browser_close(sid1, "turn_end")
+        assert sid1 not in gw._browser_open_locks
+
+        r_retry = await gw._browser_plug_call(
+            2, hid, sid1, ORG, WS, "navigate", plugs_plane.find("browser", "navigate"),
+            {"url": "example.com"}, cfg, time.time(),
+        )
+        assert json.loads(r_retry.body)["result"]["isError"] is False
+        assert len(ven.created) == 1
+        assert sid1 not in gw._browser_open_locks
+        await gw._browser_close(sid1, "turn_end")
+
+        async def boom(*a, **kw):
+            raise RuntimeError("boom")
+
+        monkeypatch.setattr(browser_plane, "open_session", boom)
+        r_err = await gw._browser_plug_call(
+            3, hid, sid2, ORG, WS, "navigate", plugs_plane.find("browser", "navigate"),
+            {"url": "example.com"}, cfg, time.time(),
+        )
+        assert json.loads(r_err.body)["result"]["isError"] is True
+        assert sid2 not in gw._browser_open_locks
+        await gw._browser_close(sid2, "turn_end")
+        assert sid2 not in gw._browser_open_locks
+
+    asyncio.run(go())
+
+
+def test_browser_open_lock_is_not_leaked_when_another_replica_closes(client, world):
+    """If another replica deletes the browser record first, closing here still leaves no lock behind."""
+    reg, _, _ = world
+    reg.record = _record()
+    hid = _harness(client)
+    _include(client, hid)
+    sid = _session_of(hid)
+    cfg = {"allow_domains": [], "deny_domains": []}
+
+    async def go():
+        r = await gw._browser_plug_call(
+            1, hid, sid, ORG, WS, "navigate", plugs_plane.find("browser", "navigate"),
+            {"url": "example.com"}, cfg, time.time(),
+        )
+        assert json.loads(r.body)["result"]["isError"] is False
+        assert await browser_plane.registry.delete(sid) is True
+        await gw._browser_close(sid, "turn_end")
+        assert sid not in gw._browser_open_locks
+        assert sid not in browser_plane.sessions()
+
+    asyncio.run(go())
+
+
+def test_cancelled_browser_open_waiter_and_holder_clean_up_lock(client, world, monkeypatch):
+    """Cancelling either a queued waiter or the lock holder cleans up _browser_open_locks cleanly."""
+    reg, ven, _ = world
+    reg.record = _record()
+    hid = _harness(client)
+    _include(client, hid)
+    sid1, sid2 = _session_of(hid), _session_of(hid)
+    cfg = {"allow_domains": [], "deny_domains": []}
+    real = browser_plane.vendor_create
+
+    async def go():
+        entered1, release1, gated1 = asyncio.Event(), asyncio.Event(), False
+
+        async def slow_vendor_1(*a, **kw):
+            nonlocal gated1
+            if not gated1:
+                gated1 = True
+                entered1.set()
+                await asyncio.wait_for(release1.wait(), timeout=1.0)
+            return await real(*a, **kw)
+
+        monkeypatch.setattr(browser_plane, "vendor_create", slow_vendor_1)
+        t1 = asyncio.create_task(gw._browser_plug_call(
+            1, hid, sid1, ORG, WS, "navigate", plugs_plane.find("browser", "navigate"),
+            {"url": "example.com"}, cfg, time.time(),
+        ))
+        await asyncio.wait_for(entered1.wait(), timeout=1.0)
+        t2 = asyncio.create_task(gw._browser_plug_call(
+            2, hid, sid1, ORG, WS, "screenshot", plugs_plane.find("browser", "screenshot"),
+            {}, cfg, time.time(),
+        ))
+        await asyncio.wait_for(_wait_until(lambda: _open_waiter_queued(sid1)), timeout=1.0)
+        t2.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await asyncio.wait_for(t2, timeout=1.0)
+        release1.set()
+        res1 = await asyncio.wait_for(t1, timeout=1.0)
+        assert json.loads(res1.body)["result"]["isError"] is False
+        assert len(ven.created) == 1
+        assert gw._browser_open_locks == {}
+        await gw._browser_close(sid1, "turn_end")
+
+        created_before = len(ven.created)
+        entered2, release2, gated2 = asyncio.Event(), asyncio.Event(), False
+
+        async def slow_vendor_2(*a, **kw):
+            nonlocal gated2
+            if not gated2:
+                gated2 = True
+                entered2.set()
+                await asyncio.wait_for(release2.wait(), timeout=1.0)
+            return await real(*a, **kw)
+
+        monkeypatch.setattr(browser_plane, "vendor_create", slow_vendor_2)
+        h1 = asyncio.create_task(gw._browser_plug_call(
+            3, hid, sid2, ORG, WS, "navigate", plugs_plane.find("browser", "navigate"),
+            {"url": "example.com"}, cfg, time.time(),
+        ))
+        await asyncio.wait_for(entered2.wait(), timeout=1.0)
+        h2 = asyncio.create_task(gw._browser_plug_call(
+            4, hid, sid2, ORG, WS, "screenshot", plugs_plane.find("browser", "screenshot"),
+            {}, cfg, time.time(),
+        ))
+        await asyncio.wait_for(_wait_until(lambda: _open_waiter_queued(sid2)), timeout=1.0)
+        h1.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await asyncio.wait_for(h1, timeout=1.0)
+        res2 = await asyncio.wait_for(h2, timeout=1.0)
+        assert json.loads(res2.body)["result"]["isError"] is False
+        assert len(ven.created) - created_before == 1
+        assert gw._browser_open_locks == {}
+        await gw._browser_close(sid2, "turn_end")
+
+    asyncio.run(go())
+
+
+def test_browser_open_lock_handoff_serializes_same_tick_callers():
+    """Same-tick arrival during lock release must keep the queued waiter first and preserve mutual exclusion."""
+    async def go():
+        gw._browser_open_locks.clear()
+        events: list[tuple[str, str]] = []
+        a_in = asyncio.Event()
+        release_a = asyncio.Event()
+
+        async def hold_a():
+            async with gw._browser_open_lock("s"):
+                events.append(("enter", "a"))
+                a_in.set()
+                await asyncio.wait_for(release_a.wait(), timeout=1.0)
+                events.append(("exit", "a"))
+
+        async def run(tag: str):
+            async with gw._browser_open_lock("s"):
+                events.append(("enter", tag))
+                await asyncio.sleep(0)
+                events.append(("exit", tag))
+
+        ta = asyncio.create_task(hold_a())
+        await asyncio.wait_for(a_in.wait(), timeout=1.0)
+        tb = asyncio.create_task(run("b"))
+        await asyncio.wait_for(
+            _wait_until(lambda: gw._browser_open_locks.get("s", [None, 0])[1] == 2),
+            timeout=1.0,
+        )
+        release_a.set()
+        tc = asyncio.create_task(run("c"))
+        await asyncio.wait_for(asyncio.gather(ta, tb, tc), timeout=1.0)
+        assert events == [("enter", "a"), ("exit", "a"),
+                          ("enter", "b"), ("exit", "b"),
+                          ("enter", "c"), ("exit", "c")]
+        assert gw._browser_open_locks == {}
+
+        a2_in, release_a2 = asyncio.Event(), asyncio.Event()
+
+        async def hold_stale():
+            async with gw._browser_open_lock("s2"):
+                a2_in.set()
+                await asyncio.wait_for(release_a2.wait(), timeout=1.0)
+
+        t_stale = asyncio.create_task(hold_stale())
+        await asyncio.wait_for(a2_in.wait(), timeout=1.0)
+        gw._browser_open_locks.clear()
+        t_new_in, release_new = asyncio.Event(), asyncio.Event()
+
+        async def hold_new():
+            async with gw._browser_open_lock("s2"):
+                t_new_in.set()
+                await asyncio.wait_for(release_new.wait(), timeout=1.0)
+
+        t_new = asyncio.create_task(hold_new())
+        await asyncio.wait_for(t_new_in.wait(), timeout=1.0)
+        release_a2.set()
+        await asyncio.wait_for(t_stale, timeout=1.0)
+        assert "s2" in gw._browser_open_locks
+        release_new.set()
+        await asyncio.wait_for(t_new, timeout=1.0)
+        assert gw._browser_open_locks == {}
+
+        m_events: list[tuple[str, str]] = []
+        m0_in, release_m0 = asyncio.Event(), asyncio.Event()
+
+        async def hold_m0():
+            async with gw._browser_open_lock("s3"):
+                m_events.append(("enter", "m0"))
+                m0_in.set()
+                await asyncio.wait_for(release_m0.wait(), timeout=1.0)
+                m_events.append(("exit", "m0"))
+
+        async def m_waiter(tag: str):
+            async with gw._browser_open_lock("s3"):
+                m_events.append(("enter", tag))
+                await asyncio.sleep(0)
+                m_events.append(("exit", tag))
+
+        m0 = asyncio.create_task(hold_m0())
+        await asyncio.wait_for(m0_in.wait(), timeout=1.0)
+        w1 = asyncio.create_task(m_waiter("w1"))
+        w2 = asyncio.create_task(m_waiter("w2"))
+        w3 = asyncio.create_task(m_waiter("w3"))
+        await asyncio.wait_for(
+            _wait_until(lambda: gw._browser_open_locks.get("s3", [None, 0])[1] == 4),
+            timeout=1.0,
+        )
+        w2.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await asyncio.wait_for(w2, timeout=1.0)
+        release_m0.set()
+        await asyncio.wait_for(asyncio.gather(m0, w1, w3), timeout=1.0)
+        assert m_events == [("enter", "m0"), ("exit", "m0"),
+                            ("enter", "w1"), ("exit", "w1"),
+                            ("enter", "w3"), ("exit", "w3")]
+        assert gw._browser_open_locks == {}
+
+    try:
+        asyncio.run(go())
+    finally:
+        gw._browser_open_locks.clear()
+
+
 def test_a_call_that_lands_on_another_replica_reaches_the_same_browser(client, world):
     """The sandbox's tool calls are load-balanced over every gateway replica on the hosted service.
     The record of a session's browser is one for all of them; a replica that has never seen the
